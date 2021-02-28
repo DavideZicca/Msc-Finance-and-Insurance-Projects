@@ -1,0 +1,933 @@
+---
+title: "Mortality evolution in Iceland"
+author: "Davide Zicca"
+output: pdf_document
+---
+
+# Goal of the project and data setting
+
+Purpose of the following work: select mortality models for projecting mortality rates into the future, i.e. making forecasts and computing annuities. The first lines of code used are fundamental to run the libraries needed:
+
+```{r echo=TRUE}
+# Packages to install on first launch
+#install.packages("demography")
+#install.packages("StMoMo")
+#install.packages("MTS")
+#install.packages("devtools")
+#install_github("robjhyndman/demography")
+
+library(demography)
+library("StMoMo")
+library("MTS")
+library(devtools)
+library(fanplot)
+library(xlsx) #it allows to read directly an xlsx file
+library(writexl) #it allows to write directly an xlsx file
+```
+
+Then, I’ve decided how to set the data:
+
+```{r echo=TRUE}
+##### Data setting
+a.min <- 20
+a.max <- 99
+omega <-121
+A.fit <-c(a.min:a.max)
+y.fit.min <- 1978
+y.fit.max <- 2018
+Y.fit <- c(y.fit.min:y.fit.max)
+y.pred <- 100
+Y.pred <- c((y.fit.max+1):(y.fit.max+y.pred))
+n.sim <- 1000
+n.boot <- 20  #you can also use 50 bootstrap but it'll require a lot of time
+int_vect <- c(rep(0.02,omega-a.min)) # vector of interest rates (flat)
+v_vect <- cumprod((1+int_vect)^-1) # vector of discount factors
+#####
+```
+
+Using a.min(=20) and a.max(=99), I’ve fixed the interval 20-99 years. While y.fit.min and y.fit.max are fixed to determine the lower and upper limit of the vector containing the years that will be included in the fit. In this way, we’re disregarding the first ages which are related to high uncertainty due to newborns’ deaths; we’re also disregarding ages greater than 99 in order to get rid of a lot of variability.
+Now we insert the data referring to the population of Iceland from year 1978 up to year 2018, both data for male and female population. We type the following command to upload data directly from the Human Mortality Database (HMD, https://www.mortality.org/, a profile is required):
+
+```{r echo=TRUE}
+ISLdata <- hmd.mx(country = "ISL", username = paste0("dadde95@gmail.com"),
+                  password = 1588261117, label = "Iceland")
+ISLmStMoMo <- StMoMoData(ISLdata, series = "male")
+ISLfStMoMo <- StMoMoData(ISLdata, series = "female")
+ISLmRates <- ISLmStMoMo$Dxt/ISLmStMoMo$Ext
+ISLmRates <- ISLmRates[A.fit+1,tail(ISLmStMoMo$years+1,length(Y.fit))-ISLmStMoMo$years[1]]
+ISLfRates <- ISLfStMoMo$Dxt/ISLfStMoMo$Ext
+ISLfRates <- ISLfRates[A.fit+1,tail(ISLfStMoMo$years+1,length(Y.fit))-ISLfStMoMo$years[1]]
+```
+
+# Lee-Carter Model
+
+It’s a one factor model to assess longevity data in a stochastic way by fitting the past mortality data and modelling the time trend as a stochastic process. The formula is:
+
+$ \ln(m_{x,t}) = \alpha_x+\beta_xk_t+\epsilon_{x,t} $
+
+Where, Where $m_{x,t}$ is the central rate of mortality for a life aged x for the year t. The model is made up from a component $\alpha_x$, which is independent of time and the product of a second age dependent component, $\beta_x$, and a time dependent parameter $k_t$ . The $\alpha_x$ term can be considered to represent the underlying mortality profile independent of time effects and the bx term can be considered as a modulating factor adjusting the common time improvement effect κt for each specific age x. The last term represents the error terms representing age-specific influences that are not captured by the model. They are assumed to be normally distributed with mean=zero and standard deviation=$\sigma^2$. In order to project mortality, the time index κt is modelled and forecasted using ARIMA processes.
+Up to this point I was curious to make comparisons between the log and logit models, that’s why we start from the Lee-Carter Model (using link=”log”, i.e. using the default values of lc which is the log version of the model):
+
+```{r echo=TRUE}
+#ISLfStMoMo and ISLmStMoMo have a central Exposure by default
+LCfit_ISLm <- fit(lc(), data = ISLmStMoMo, ages.fit = a.min:a.max,
+                  years.fit=y.fit.min:y.fit.max)
+
+LCfit_ISLf <- fit(lc(), data = ISLfStMoMo, ages.fit = a.min:a.max,
+                  years.fit=y.fit.min:y.fit.max)
+LCfit_ISLm
+LCfit_ISLf
+```
+
+We are fitting the Lee-Carter model on the male and female series by looking to ages starting from 20 up to 99, and for years belonging in the interval 1978-2018.
+Then, we plotted (I’ll show here only the plots relative to male individuals):
+
+```{r echo=TRUE}
+summary(LCfit_ISLm)
+summary(LCfit_ISLf)
+
+BIC(LCfit_ISLm)
+BIC(LCfit_ISLf)
+
+plot(LCfit_ISLm)
+
+par(mfrow=c(2, 3))
+plot(LCfit_ISLm$ax, main="Alpha - Male population")
+plot(LCfit_ISLm$bx, main="Beta - Male population")
+plot(t(LCfit_ISLm$kt), main="Kappa - Male population")
+
+LCres_ISLm <- residuals(LCfit_ISLm)        
+LCres_ISLf <- residuals(LCfit_ISLf)        
+plot(LCres_ISLm)
+
+plot(LCres_ISLm , type = "signplot")
+plot(LCres_ISLm , type = "colourmap")
+```
+
+# Cairns-Blake-Dowd (CBD) Model (using link=”log”)
+
+It’s a two factor model of mortality, with the first factor affecting mortality at all ages equally and the second factor affecting mortality in a way proportionate to the age. The equation of the CBD model is given by:
+
+$ \eta_{x,t}= k_t^{(1)}+(x- \bar x ) k_t^{(2)}$
+
+Where x-bar is the average age in the data. The mortality forecasts are obtained by projecting the period effects κ(1) and κ(2) using a bivariate random walk with drift. The following codes are used to fit the data, extract and plot residuals.
+
+```{r echo=TRUE}
+CBDlogfit_ISLm <- fit(cbd(link = "log"), data = ISLmStMoMo, ages.fit = a.min:a.max,
+                   years.fit=y.fit.min:y.fit.max)
+
+CBDlogfit_ISLf <- fit(cbd(link = "log"), data = ISLfStMoMo, ages.fit = a.min:a.max,
+                   years.fit=y.fit.min:y.fit.max)
+
+CBDlogfit_ISLm
+CBDlogfit_ISLf
+summary(CBDlogDfit_ISLm)
+summary(CBDlogfit_ISLf)
+CBDlogfit_ISLf$loglik
+CBDlogfit_ISLm$loglik
+BIC(CBDlogfit_ISLm)
+BIC(CBDlogfit_ISLf)
+
+par(mar = c(2, 2, 2, 2))
+plot(CBDlogfit_ISLm)
+plot(CBDlogfit_ISLf)
+
+#plot residuals of CBD model
+CBDlogres_ISLm <- residuals(CBDlogfit_ISLm)        
+CBDlogres_ISLf <- residuals(CBDlogfit_ISLf)        
+plot(CBDlogres_ISLm)
+plot(CBDlogres_ISLf)
+plot(CBDlogres_ISLm , type = "signplot")
+plot(CBDlogres_ISLf , type = "signplot")
+plot(CBDlogres_ISLm , type = "colourmap")
+plot(CBDlogres_ISLf , type = "colourmap")
+```
+
+# Renshaw and Haberman (RH) model (with link=”log”)
+
+It is an extension of the Lee-Carter model, g is the parameter that estimates the cohort effect.
+The equation of the model is:
+
+$ \ln(m_{x,t}) = \alpha_x+\beta_{1,x}k_{1,t}+\beta_{0,x}\gamma_{t-x} $
+
+Mortality projections for this model are derived using time series forecast of the estimated k and \gamma, generated using univariate ARIMA processes under the assumption of independence between the period and the cohort effects.
+I’ve chosen a RH model with the log-Poisson version and with the cohort age modulating parameter equal to 1. This is the code that I’ve run for both Male and Female population:
+
+```{r echo=TRUE}
+RHfit_ISLm <- fit(rh(), data = ISLmStMoMo, ages.fit = A.fit, years.fit = Y.fit )
+RHfit_ISLf <- fit(rh(), data = ISLfStMoMo, ages.fit = A.fit, years.fit = Y.fit)
+RHfit_ISLm
+RHfit_ISLf
+
+summary(RHfit_ISLm)
+summary(RHfit_ISLf)
+RHfit_ISLf$loglik
+RHfit_ISLm$loglik
+BIC(RHfit_ISLm)
+BIC(RHfit_ISLf)
+
+par(mar = c(2, 2, 2, 2))
+plot(RHfit_ISLm)
+plot(RHfit_ISLf)
+
+
+#plot residuals of RH model
+RHres_ISLm <- residuals(RHfit_ISLm)        
+plot(RHres_ISLm)
+plot(RHres_ISLm , type = "signplot")
+plot(RHres_ISLm , type = "colourmap")
+```
+
+# Comparing Models
+
+**I’ll just show all the plots about the male population in order to have a summary of what I’ve done. But all the plots about female population are stored and ready to be sent, if they will be necessary. However, all the lines of code are fully reported in the R script files. For the sake of clarity, I’ll only reports the 3 best models that we’ll be then discussed.**
+
+Preparing the models:
+```{r echo=TRUE}
+####################################
+################### Comparing models using the weights and as
+################### link function the logit one
+###################################
+ISLmIniData <- central2initial(ISLmStMoMo)
+ISLfIniData <- central2initial(ISLfStMoMo)
+wxt= genWeightMat(ages = A.fit, years = Y.fit, clip = 3 )
+ISLmIniData
+```
+
+*This is used to limit some cohorts. We may not have enough information about some cohorts and so, we can disregard them in order to avoid to fix cohort parameters.*
+
+# Male - LC model with logit
+
+```{r echo=TRUE}
+#Male LC model with logit
+LClogit <- lc(link = "logit")
+LClogit$gnmFormula
+LCfitlogit_ISLm<-fit(LClogit, data = ISLmIniData, ages.fit = A.fit, 
+                     years.fit = Y.fit, wxt = wxt)
+head(LCfitlogit_ISLm)
+summary(LCfitlogit_ISLm)
+BIC(LCfitlogit_ISLm)
+
+par(mar = c(2, 2, 2, 2))
+plot(LCfitlogit_ISLm)
+
+par(mfrow=c(2, 3))
+plot(LCfitlogit_ISLm$ax, main="Alpha - Male population")
+plot(LCfitlogit_ISLm$bx, main="Beta - Male population")
+plot(t(LCfitlogit_ISLm$kt), main="Kappa - Male population")
+
+
+LCresLOGIT_ISLm <- residuals(LCfitlogit_ISLm)
+plot(LCresLOGIT_ISLm)
+plot(LCresLOGIT_ISLm , type = "signplot")
+plot(LCresLOGIT_ISLm , type = "colourmap")
+```
+
+# Male - RH model with logit
+
+```{r echo=TRUE}
+#Male RH model with logit
+
+RHlogit <- rh(link = "logit", cohortAgeFun = "1")
+
+RHfitlogit_ISLm<-fit(RHlogit, data = ISLmIniData, ages.fit = A.fit, 
+                      years.fit = Y.fit, wxt = wxt)
+
+RHfitlogit_ISLm
+summary(RHfitlogit_ISLm)
+BIC(RHfitlogit_ISLm)
+
+par(mar = c(2, 2, 2, 2))
+plot(RHfitlogit_ISLm)
+
+par(mfrow=c(2, 3))
+plot(RHfitlogit_ISLm$ax, main="Alpha - Male population")
+plot(RHfitlogit_ISLm$bx, main="Beta - Male population")
+plot(t(RHfitlogit_ISLm$kt), main="Kappa - Male population")
+
+
+RHresLOGIT_ISLm <- residuals(RHfitlogit_ISLm)
+plot(RHresLOGIT_ISLm)
+plot(RHresLOGIT_ISLm , type = "signplot")
+plot(RHresLOGIT_ISLm , type = "colourmap")
+```
+
+# Male - PLAT model with logit
+
+It’s a four factor model which took its beginnings from the Lee-Carter model and which added factors to capture the second age-period effect, as per the CBD model and the cohort effect, as per the Renshaw and Haberman model. The innovation in the Plat model was to then add a further period factor affecting only the lower ages and designed to allow the model to fit to the whole age range. The model specification is given by:
+
+$ \ln(m_{x,t}) = \alpha_x+k_{t}^{(1)}+ (x- \bar x ) k_t^{(2)} + (x- \bar x ) k_t^{(3)+} + \gamma_{t-x}$
+
+```{r echo=TRUE}
+#####################################
+##### PLAT model
+#####################################
+f2 <- function(x, ages) mean(ages) - x
+constPlat <- function(ax, bx, kt, b0x, gc, wxt, ages){
+  nYears <- dim(wxt)[2]
+  x <- ages
+  t <- 1:nYears
+  c <- (1 - tail(ages, 1)):(nYears - ages[1])
+  xbar <- mean(x)
+  phiReg <- lm(gc ~ 1 + c + I(c ^ 2), na.action = na.omit)
+  phi <- coef(phiReg)
+  gc <- gc - phi[1] - phi[2] * c - phi[3] * c ^ 2
+  kt[2, ] <- kt[2, ] + 2 * phi[3] * t
+  kt[1, ] <- kt[1, ] + phi[2] * t + phi[3] * (t ^ 2 - 2 * xbar * t)
+  ax <- ax + phi[1] - phi[2] * x + phi[3] * x ^ 2
+  ci <- rowMeans(kt, na.rm = TRUE)
+  ax <- ax + ci[1] + ci[2] * (xbar - x)
+  kt[1, ] <- kt[1, ] - ci[1]
+  kt[2, ] <- kt[2, ] - ci[2]
+  list(ax = ax, bx = bx, kt = kt, b0x = b0x, gc = gc)
+}
+PLAT <- StMoMo(link = "logit", staticAgeFun = TRUE,
+               periodAgeFun = c("1", f2), cohortAgeFun = "1", constFun = constPlat)
+
+#Male PLAT model with logit
+PLATfitlogit_ISLm <- fit(PLAT, data = ISLmIniData, ages.fit = A.fit,years.fit=Y.fit, wxt = wxt)
+PLATfitlogit_ISLm
+
+par(mar = c(2, 2, 2, 2))
+plot(PLATfitlogit_ISLm, parametricbx = F)
+
+par(mfrow=c(1, 3))
+plot(PLATfitlogit_ISLm$ax, main="Alpha - Male population")
+plot(PLATfitlogit_ISLm$bx, main="Beta - Male population")
+plot(t(PLATfitlogit_ISLm$kt), main="Kappa - Male population")
+
+
+PLATreslogitm <- residuals(PLATfitlogit_ISLm)
+plot(PLATreslogitm)
+par(mfrow=c(1, 1))
+plot(PLATreslogitm , type = "signplot")
+plot(PLATreslogitm , type = "colourmap")
+```
+
+The log-likelihood information is useful in evaluating the goodness of fit of models and to choose the best models for our data. We will select the model with the greatest log-likelihood value. We will use also the Bayesian Information Criteria (BIC) that is a method to choose the best models by taking into account the number of parameters: a model with fewer parameters is preferable to a model with a large number of parameters. This ensures that extra parameters are only included when there is a significant improvement in fit while models with a larger number of parameters are penalized. We will select the model with the lowest BIC value.
+
+
+
+```{r echo=TRUE}
+#####################################
+######### Models comparison
+#####################################
+
+#quantitative comparative using BIC and log-likelihood
+
+#comparing MALE results with logs
+loglikemalelogs= c(RHfit_ISLm$loglik,CBDlogfit_ISLm$loglik, LCfit_ISLm$loglik)
+BICmalelogs= c(BIC(RHfit_ISLm), BIC(CBDlogfit_ISLm), BIC(LCfit_ISLm))
+
+rowSloglikemale = c("RH", "CBD", "LC")
+loglikeResultsmale= data.frame(loglikemalelogs, row.names = rowSloglikemale )
+loglikeResultsmale
+
+loglikeResultsmale[which.max(loglikeResultsmale$loglikemalelogs),]
+
+rowSBICmale= c("RH", "CBD", "LC")
+BIClogsResultsmale= data.frame(BICmalelogs, row.names = rowSBICmale )
+BIClogsResultsmale
+
+BIClogsResultsmale[which.min(BIClogsResultsmale$BICmalelogs),]
+
+#comparing FEMALE results with logs
+
+loglikefemalelogs= c(RHfit_ISLf$loglik,CBDlogfit_ISLf$loglik, LCfit_ISLf$loglik)
+BICfemalelogs= c(BIC(RHfit_ISLf), BIC(CBDlogfit_ISLf), BIC(LCfit_ISLf))
+
+rowSloglikefemale = c("RH", "CBD", "LC")
+loglikeResultsfemale= data.frame(loglikefemalelogs, row.names = rowSloglikefemale )
+loglikeResultsfemale
+loglikeResultsfemale[which.max(loglikeResultsfemale$loglikefemalelogs),]
+
+rowSBICfemale= c("RH", "CBD", "LC")
+BIClogsResultsfemale= data.frame(BICfemalelogs, row.names = rowSBICfemale )
+BIClogsResultsfemale
+BIClogsResultsfemale[which.min(BIClogsResultsfemale$BICfemalelogs),]
+
+
+#comparing MALE results with LOGIT
+loglikemaleLOGIT= c(RHfitlogit_ISLm$loglik,CBDfitlogit_ISLm$loglik, 
+                   LCfitlogit_ISLm$loglik, APCfitlogitm$loglik, M7fitlogitm$loglik, PLATfitlogit_ISLm$loglik)
+BICmaleLOGIT= c(BIC(RHfitlogit_ISLm), BIC(CBDfitlogit_ISLm), BIC(LCfitlogit_ISLm), 
+               BIC(APCfitlogitm),BIC(M7fitlogitm), BIC(PLATfitlogit_ISLm))
+
+rowSLOGITlikemale = c("RH", "CBD", "LC", "APC", "M7", "PLAT")
+LOGITlikeResultsmale= data.frame(loglikemaleLOGIT, row.names = rowSLOGITlikemale )
+LOGITlikeResultsmale
+
+LOGITlikeResultsmale[which.max(LOGITlikeResultsmale$loglikemaleLOGIT),]
+
+rowSBICLOGITmale= c("RH", "CBD", "LC", "APC", "M7", "PLAT")
+BICLOGITResultsmale= data.frame(BICmaleLOGIT, row.names = rowSBICLOGITmale )
+BICLOGITResultsmale
+
+BICLOGITResultsmale[which.min(BICLOGITResultsmale$BICmaleLOGIT),]
+#comparing FEMALE results with LOGIT
+
+loglikefemaleLOGIT= c(RHfitlogit_ISLf$loglik,CBDfitlogit_ISLf$loglik, 
+                    LCfitlogit_ISLf$loglik, APCfitlogitf$loglik, 
+                    M7fitlogitf$loglik, PLATfitlogit_ISLf$loglik)
+BICfemaleLOGIT= c(BIC(RHfitlogit_ISLf), BIC(CBDfitlogit_ISLf), BIC(LCfitlogit_ISLf), 
+                BIC(APCfitlogitf),BIC(M7fitlogitf), BIC(PLATfitlogit_ISLf))
+
+rowSLOGITlikefemale = c("RH", "CBD", "LC", "APC", "M7", "PLAT")
+LOGITlikeResultsfemale= data.frame(loglikefemaleLOGIT, row.names = rowSLOGITlikefemale )
+LOGITlikeResultsfemale
+
+LOGITlikeResultsfemale[which.max(LOGITlikeResultsfemale$loglikefemaleLOGIT),]
+
+rowSBICLOGITfemale= c("RH", "CBD", "LC", "APC", "M7", "PLAT")
+BICLOGITResultsfemale= data.frame(BICfemaleLOGIT, row.names = rowSBICLOGITfemale )
+BICLOGITResultsfemale
+BICLOGITResultsfemale[which.min(BICLOGITResultsfemale$BICfemaleLOGIT),]
+
+
+#number of parameters in the Logit models
+
+RHfitlogit_ISLm$npar
+CBDfitlogit_ISLm$npar
+LCfitlogit_ISLm$npar
+APCfitlogitm$npar
+M7fitlogitm$npar
+PLATfitlogit_ISLm$npar
+
+n.parameters=c(RHfitlogit_ISLm$npar,CBDfitlogit_ISLm$npar,LCfitlogit_ISLm$npar,APCfitlogitm$npar,
+               M7fitlogitm$npar,PLATfitlogit_ISLm$npar)
+modelsparameters=data.frame(n.parameters,row.names = rowSBICLOGITfemale )
+
+RHfitlogit_ISLf$npar
+CBDfitlogit_ISLf$npar
+LCfitlogit_ISLf$npar
+APCfitlogitf$npar
+M7fitlogitf$npar
+PLATfitlogit_ISLf$npar
+```
+
+We can see that the RH model is the one that has more parameters (=312), while the one that has less parameters is the CBD model (=89). From now on, I will disregard the log models because I’ve chosen to compare the PLAT model with the Lee-Carter model and the Renshaw and Haberman (RH) model that shows a better goodness of fit using as link function= “logit”. Considering that the plots about the Renshaw and Haberman (RH) model are very randomic and they do not show particular patterns, I would select this model to make forecasts.
+Other two models that show randomic plots as well as good results about BIC and Log-likelihood are the PLAT model and Lee-Carter (LC) model in logit. These two are the other candidates to make forecasts.
+I would discard the CBD model (and its alternative version: the M7 model) due to the fact that when we analyse the plots (in particular the residuals’ plots) they show more patterns with respect to the chosen models (RH, PLAT and LC).
+
+# Forecasting the chosen logit models
+
+Useful Functions:
+```{r echo=TRUE}
+#####################################
+##### PLAT model
+#####################################
+f2 <- function(x, ages) mean(ages) - x
+constPlat <- function(ax, bx, kt, b0x, gc, wxt, ages){
+ nYears <- dim(wxt)[2]
+ x <- ages
+ t <- 1:nYears
+ c <- (1 - tail(ages, 1)):(nYears - ages[1])
+ xbar <- mean(x)a
+ phiReg <- lm(gc ~ 1 + c + I(c ^ 2), na.action = na.omit)
+ phi <- coef(phiReg)
+ gc <- gc - phi[1] - phi[2] * c - phi[3] * c ^ 2
+ kt[2, ] <- kt[2, ] + 2 * phi[3] * t
+ kt[1, ] <- kt[1, ] + phi[2] * t + phi[3] * (t ^ 2 - 2 * xbar * t)
+ ax <- ax + phi[1] - phi[2] * x + phi[3] * x ^ 2
+ ci <- rowMeans(kt, na.rm = TRUE)
+ ax <- ax + ci[1] + ci[2] * (xbar - x)
+ kt[1, ] <- kt[1, ] - ci[1]
+ kt[2, ] <- kt[2, ] - ci[2]
+ list(ax = ax, bx = bx, kt = kt, b0x = b0x, gc = gc)
+ }
+PLAT <- StMoMo(link = "logit", staticAgeFun = TRUE,
+ periodAgeFun = c("1", f2), cohortAgeFun = "1", constFun = constPlat)
+#####################################
+
+####################################
+#### EXTRAPOLATION qxt UP TO EXTREME AGE VIA EXTRAPOLATION
+####################################
+extrapolation.fit <- function(q){
+logit_q <- log(q/(1-q))
+#y = logit_q = ax+b
+a1_log <- min((a.max-9),90) # starting age linear model
+a2_log <- a.max # ending age linear model
+l_vet1 <- c((a1_log-a.min+1):(a2_log-a.min+1))
+lm(logit_q[l_vet1,]~A.fit[l_vet1])
+B <- lm(logit_q[l_vet1,]~A.fit[l_vet1])$coeff[1,]
+A <- lm(logit_q[l_vet1,]~A.fit[l_vet1])$coeff[2,]
+
+a1_ext <- min((a.max-4),100) #starting age extrapolation
+a2_ext <- omega-1 # ending age extrapolation
+Age1 <- c(a1_ext:a2_ext)
+Age2 <- c(a.min:a2_ext)
+q_tail=array(0,dim=c(length(Age1),(length(Y.fit)+y.pred)), dimnames=list(Age1,c(Y.fit,Y.pred)))
+for (j in Age1){
+    q_tail[(j-Age1[1]+1),] <- exp(A*j+B)/(1+exp(A*j+B))
+}
+l_vet3 <- c(1:(a1_ext-a.min))
+l_vet4 <- c(1:(a2_ext-a.min+1))
+q.ext=array(0,dim=c(length(c(a.min:a2_ext)),(length(Y.fit)+y.pred)),
+   dimnames=list(c(a.min:a2_ext),c(Y.fit,Y.pred)))
+for (j in 1:(length(Y.fit)+y.pred)){
+  q.ext[,j] <- c(q[l_vet3,j],q_tail[,j])
+}
+q.ext[(omega-a.min),]=1
+return(q.ext)
+}
+#####################################
+
+#####################################
+#### EXTRAPOLATION SIMULATED qxt UP TO EXTREME AGE VIA EXTRAPOLATION
+#####################################
+extrapolation.sim <- function(q.st){
+logit_q.st <- log(q.st/(1-q.st))
+#y = logit_q.st = ax+b
+B <- matrix(0, nrow=n.sim, ncol=y.pred)
+A <- matrix(0, nrow=n.sim, ncol=y.pred)
+a1_log <- min((a.max-9),90) # starting age graduation
+a2_log <- a.max # ending age graduation
+l_vet1 <- c((a1_log-a.min+1):(a2_log-a.min+1))
+for (k in 1:n.sim){
+  lm(logit_q.st[l_vet1,,k]~A.fit[l_vet1])
+  B[k,] <- lm(logit_q.st[l_vet1,,k]~A.fit[l_vet1])$coeff[1,1:y.pred]
+  A[k,] <- lm(logit_q.st[l_vet1,,k]~A.fit[l_vet1])$coeff[2,1:y.pred]
+}
+
+a1_ext <- min((a.max-4),100) #starting age extrapolation
+a2_ext <- omega-1 # ending age extrapolation
+Age1 <- c(a1_ext:a2_ext)
+Age2 <- c(a.min:a2_ext)
+q_tail.st=array(0,dim=c(length(Age1),y.pred,n.sim), dimnames=list(Age1,Y.pred,
+  c(1:n.sim)))
+for (j in Age1){
+  for (k in 1:n.sim){
+    q_tail.st[(j-Age1[1]+1),,k] <- exp(A[k,]*j+B[k,])/(1+exp(A[k,]*j+B[k,]))
+  }
+}
+l_vet3 <- c(1:(a1_ext-a.min))
+l_vet4 <- c(1:(a2_ext-a.min+1))
+q.st.ext=array(0,dim=c(length(c(a.min:a2_ext)),y.pred,n.sim),
+   dimnames=list(c(a.min:a2_ext),Y.pred,c(1:n.sim)))
+for (j in 1:y.pred){
+  for (k in 1:n.sim){
+  q.st.ext[,j,k] <- c(q.st[l_vet3,j,k],q_tail.st[,j,k])
+  }
+}
+q.st.ext[(omega-a.min),,]=1
+return(q.st.ext)
+}
+#####################################
+
+####################################
+######## Life expectancy
+####################################
+life.exp <- function(q){
+p <- 1-q # 1 year survival probability
+p0n <- apply(p, 2, cumprod) # n year survival probability
+ex <- p0n
+ex[1,] <- apply(p0n, 2, sum)+0.5
+ex[2,] <- (apply(p0n, 2, sum)-p0n[1,])/p0n[1,]+0.5
+for (j in 3:(omega-a.min)){
+      ex[j,]<-(apply(p0n, 2, sum)-apply(p0n[1:(j-1),],2,sum))/p0n[(j-1),]+0.5
+}
+return(ex)
+}
+
+####################################
+##### Present value of annuities from a matrix of death probabilities q(x,t)
+####################################
+annuity <- function(q,v_vect){
+#q <- q_ITAm.ext
+p <- 1-q
+p0n <- apply(p,2,cumprod)
+E0n <-  p0n*v_vect
+ann0 <-  apply(E0n, 2, cumsum) # matrix of present values of annuity starting from age 0
+annx <- array(0,dim=c(nrow(q),ncol(q)), dimnames=list(rownames(q),colnames(q)))
+annx[1,] <- ann0[omega-a.min,]
+for (j in 2:(omega-a.min)){
+      annx[j,] <- (ann0[omega-a.min,]-ann0[j-1,])/E0n[j-1,] # matrix of present values of annuity starting from age x
+}
+return(annx)
+}
+####################################
+
+
+####################################
+##### Present value of annuities from N. sim matrices of death probabilities q(x,t)
+####################################
+annuity.st <- function(q.st,v_vect, conf.lev){
+p.st <- 1-q.st # 1 year survival probability
+p0n.st <- apply(p.st, c(2,3), cumprod) # n year survival probability from age 0
+E0n.st <-  p0n.st*v_vect
+ann0.st <-  apply(E0n.st, c(2,3), cumsum) # matrix of present values of annuity starting from age 0
+annx.st <- array(0,dim=c((omega-a.min),y.pred,n.sim), dimnames=list(c(a.min:(omega-1)),Y.pred,c(1:n.sim)))
+annx.st[1,,] <- ann0.st[omega-a.min,,]
+for (j in 2:(omega-a.min)){
+      annx.st[j,,] <- (ann0.st[omega-a.min,,]-ann0.st[j-1,,])/E0n.st[j-1,,] # matrix of present values of annuity starting from age x
+}
+ann.mean <- apply(annx.st, c(1,2),mean) # expected present value of annuity starting form age x
+ann.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+ann.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+      ann.q95[j,k] <- quantile(annx.st[j,k,], probs=0.5+conf.lev/2)
+      ann.q05[j,k] <- quantile(annx.st[j,k,], probs=(1-conf.lev)/2)
+  }
+}
+return(list(ann.mean,ann.q95,ann.q05))
+}
+####################################
+```
+
+*Lee-Carter*
+
+```{r echo=TRUE}
+
+####################################
+################### Lee-Carter model with logit
+####################################
+################### Forecast
+LCfor_ISLm <- forecast(LCfitlogit_ISLm, h=y.pred)
+### Alternative istructions
+#LCfor_ISLmArima <- forecast(LCfitlogit_ISLm, h=y.pred, kt.method = "iarima",  kt.order = c(1, 1, 2))  # ARIMA order specified
+#LCfor_ISLmBArima <- forecast(LCfitlogit_ISLm, h=y.pred, kt.method = "iarima",  kt.order = NULL)  # auto.arima
+LCfor_ISLf <- forecast(LCfitlogit_ISLf, h=y.pred)
+plot(LCfor_ISLm, only.kt = TRUE)
+plot(LCfor_ISLf, only.kt = TRUE)
+#####
+par(mfrow=c(1, 2), oma=c(2,0,0,0))
+plot(c(a.min:a.max),log(LCfor_ISLm$rates[,y.pred]), bty="l", xlab="Ages", ylab="Male death rates (log scale)",
+  ylim=c(min(log(LCfor_ISLm$rates[,y.pred])),max(log((LCfitlogit_ISLm$Dxt/LCfitlogit_ISLm$Ext)[,length(Y.fit)]))), type="l")
+lines(c(a.min:a.max),log((LCfitlogit_ISLm$Dxt/LCfitlogit_ISLm$Ext)[,length(Y.fit)]), type="p")
+plot(c(a.min:a.max),log(LCfor_ISLf$rates[,y.pred]), bty="l", xlab="Ages", ylab="Female death rates (log scale)",
+  ylim=c(min(log(LCfor_ISLf$rates[,y.pred])),max(log((LCfitlogit_ISLf$Dxt/LCfitlogit_ISLf$Ext)[,length(Y.fit)]))), type="l")
+lines(c(a.min:a.max),log((LCfitlogit_ISLf$Dxt/LCfitlogit_ISLf$Ext)[,length(Y.fit)]), type="p")
+par(fig = c(0, 1, 0, 1), oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), new = TRUE)
+plot(0, 0, type = "n", bty = "n", xaxt = "n", yaxt = "n")
+legend("bottom", c("last observed", "last projected"), pch=c(1,-1), lty=c(0,1), lwd=c(1,1), col=c(1:1), cex=0.9)
+dev.off()
+
+rates_LClogitfit_ISLm <- fitted(LCfitlogit_ISLm, type = "rates")
+rates_LClogitfor_ISLm <- LCfor_ISLm$rates
+#rates_LClogit_ISLm <- cbind(rates_LClogitfit_ISLm,rates_LClogitfor_ISLm)
+q_LC_ISLm <- 1- exp(-rates_LClogit_ISLm)
+q_LC_ISLm.ext  <- extrapolation.fit(q_LC_ISLm)
+
+rates_LClogitfit_ISLf <- fitted(LCfitlogit_ISLf, type = "rates")
+rates_LClogitfor_ISLf <- LCfor_ISLf$rates
+#rates_LC_ISLf <- cbind(rates_LCfit_ISLf,rates_LCfor_ISLf)
+q_LC_ISLf <- 1- exp(-rates_LC_ISLf)
+q_LC_ISLf.ext  <- extrapolation.fit(q_LC_ISLf)
+
+write.table(q_LC_ISLm.ext,file="q_LC.ISLm.txt",sep=",")
+write.table(q_LC_ISLf.ext,file="q_LC.ISLf.txt",sep=",")
+q_LC.ISLm<-as.data.frame(q_LC_ISLm.ext)
+q_LC.ISLf<-as.data.frame(q_LC_ISLf.ext)
+
+plot(extractCohort(q_LC_ISLm.ext, cohort = 1980), type = "p", log = "y", xlab = "age", ylab = "q(x)",
+ main = "Mortality rates for a cohort (log scale)")
+lines(extractCohort(q_LC_ISLm, cohort = 1980))
+plot(extractCohort(log(q_LC_ISLm.ext/(1-q_LC_ISLm.ext)), cohort = 1980), type = "p", xlab = "age", ylab = "logit(q(x))",
+ main = "Logit transform of mortality rates for a cohort")
+lines(extractCohort(log(q_LC_ISLm/(1-q_LC_ISLm)), cohort = 1980))
+############################
+
+####################################
+######## 1 year survival probability, n year survival probability and life expectancy
+####################################
+p_LC_ISLm.ext <- 1-q_LC_ISLm.ext # 1 year survival probability
+p0n_LC_ISLm.ext <- apply(p_LC_ISLm.ext, 2, cumprod) # n year survival probability
+ex_LC_ISLm.ext <- life.exp(q_LC_ISLm.ext)
+
+p_LC_ISLf.ext <- 1-q_LC_ISLf.ext # 1 year survival probability
+p0n_LC_ISLf.ext <- apply(p_LC_ISLf.ext, 2, cumprod) # n year survival probability
+ex_LC_ISLf.ext <- life.exp(q_LC_ISLf.ext)
+
+write.table(ex_LC_ISLm.ext,file="ex_LC.ISLm.txt",sep=",")
+write.table(ex_LC_ISLf.ext,file="ex_LC.ISLf.txt",sep=",")
+p_LC.ISLm<-as.data.frame(p_LC_ISLm.ext)
+p0n_LC.ISLm<-as.data.frame(p0n_LC_ISLm.ext)
+ex_LC.ISLm<-as.data.frame(ex_LC_ISLm.ext)
+p_LC.ISLf<-as.data.frame(p_LC_ISLf.ext)
+p0n_LC.ISLf<-as.data.frame(p0n_LC_ISLf.ext)
+ex_LC.ISLf<-as.data.frame(ex_LC_ISLf.ext)
+####################################
+
+####################################
+##### SIMULATION WITH RANDOM WALK WITH DRIFT
+####################################
+LCsim_ISLm.mrwd <- simulate(LCfitlogit_ISLm, nsim = n.sim, h=y.pred)
+### Alternative istructions
+#LCsim_ISLmArima <- forecast(LCfitlogit_ISLm, nsim = n.sim, h=y.pred, kt.method = "iarima",  kt.order = c(1, 1, 2))  # ARIMA order specified
+#LCsim_ISLmBArima <- forecast(LCfitlogit_ISLm, nsim = n.sim, h=y.pred, kt.method = "iarima",  kt.order = NULL)  # auto.arima
+rates_LC_ISLm.st <- LCsim_ISLm.mrwd$rates
+q_LC_ISLm.st <- 1- exp(-rates_LC_ISLm.st)
+q_LC_ISLm.st.ext <-  extrapolation.sim(q_LC_ISLm.st)
+
+LCsim_ISLf.mrwd <- simulate(LCfitlogit_ISLf, nsim = n.sim, h=y.pred)
+rates_LC_ISLf.st <- LCsim_ISLf.mrwd$rates
+q_LC_ISLf.st <- 1- exp(-rates_LC_ISLf.st)
+q_LC_ISLf.st.ext <-  extrapolation.sim(q_LC_ISLf.st)
+
+par(mfrow=c(1, 2))
+plot(LCfitlogit_ISLm$years, LCfitlogit_ISLm$kt[1, ], xlim = range(LCfitlogit_ISLm$years, LCsim_ISLm.mrwd$kt.s$years),
+  ylim = range(LCfitlogit_ISLm$kt, LCsim_ISLm.mrwd$kt.s$sim), type = "l", xlab = "year", ylab = "kt",
+  main = "Lee-Carter: Period index (mrwd)")
+matlines(LCsim_ISLm.mrwd$kt.s$years, LCsim_ISLm.mrwd$kt.s$sim[1, , ], type = "l", lty = 1)
+plot(LCfitlogit_ISLm$years, (LCfitlogit_ISLm$Dxt / LCfitlogit_ISLm$Ext)["65", ], xlim = range(LCfitlogit_ISLm$years, LCsim_ISLm.mrwd$years),
+  ylim = range((LCfitlogit_ISLm$Dxt / LCfitlogit_ISLm$Ext)["65", ], LCsim_ISLm.mrwd$rates["65", , ]), type = "l", xlab = "year", ylab = "rate",
+  main = "Lee-Carter: Simulated mortality rates at age 65")
+matlines(LCsim_ISLm.mrwd$years, LCsim_ISLm.mrwd$rates["65", , ], type = "l", lty = 1)
+dev.off()
+
+library("fanplot")
+probs = c(2.5, 10, 25, 50, 75, 90, 97.5)
+par(mfrow=c(1, 1))
+matplot(LCfitlogit_ISLm$years, t(q_LC_ISLm[c("65", "75", "85"),c(1:length(Y.fit)) ]),
+ xlim = c(y.fit.min, (y.fit.min+y.pred)), ylim = c(0.001, 0.2), pch = 20, col = "black",
+ log = "y", xlab = "year", ylab = "male mortality rate (log scale)")
+fan(t(LCsim_ISLm.mrwd$rates["65", , ]), start = y.fit.max+1, probs = probs, n.fan = 4,
+ fan.col = colorRampPalette(c("black", "white")), ln = NULL)
+fan(t(LCsim_ISLm.mrwd$rates["75", , ]), start = y.fit.max+1, probs = probs, n.fan = 4,
+ fan.col = colorRampPalette(c("red", "white")), ln = NULL)
+fan(t(LCsim_ISLm.mrwd$rates["85", , ]), start = y.fit.max+1, probs = probs, n.fan = 4,
+ fan.col = colorRampPalette(c("blue", "white")), ln = NULL)
+text(y.fit.min+4, q_LC_ISLm[c("65", "75", "85"), 30],
+ labels = c("x = 65", "x = 75", "x = 85"))
+matplot(LCfitlogit_ISLf$years, t(q_LC_ISLf[c("65", "75", "85"),c(1:length(Y.fit)) ]),
+ xlim = c(y.fit.min, (y.fit.min+y.pred)), ylim = c(0.001, 0.2), pch = 20, col = "black",
+ log = "y", xlab = "year", ylab = "female mortality rate (log scale)")
+fan(t(LCsim_ISLf.mrwd$rates["65", , ]), start = y.fit.max+1, probs = probs, n.fan = 4,
+ fan.col = colorRampPalette(c("black", "white")), ln = NULL)
+fan(t(LCsim_ISLf.mrwd$rates["75", , ]), start = y.fit.max+1, probs = probs, n.fan = 4,
+ fan.col = colorRampPalette(c("red", "white")), ln = NULL)
+fan(t(LCsim_ISLf.mrwd$rates["85", , ]), start = y.fit.max+1, probs = probs, n.fan = 4,
+ fan.col = colorRampPalette(c("blue", "white")), ln = NULL)
+text(y.fit.min+4, q_LC_ISLf[c("65", "75", "85"), 30],
+ labels = c("x = 65", "x = 75", "x = 85"))
+dev.off()
+####################################
+
+####################################
+####### Bootstrap
+####################################
+LCboot_ISLm <- bootstrap(LCfitlogit_ISLm, nBoot = n.boot, type = "semiparametric")
+plot(LCboot_ISLm, nCol = 3)
+LCsim_ISLm.boot <- simulate(LCboot_ISLm, nsim = n.sim/n.boot, h = y.pred)
+rates_LC_ISLm.boot.st <- LCsim_ISLm.boot$rates
+q_LC_ISLm.boot.st <- 1- exp(-rates_LC_ISLm.boot.st)
+q_LC_ISLm.boot.st.ext <-  extrapolation.sim(q_LC_ISLm.boot.st)
+
+LCboot_ISLf <- bootstrap(LCfitlogit_ISLf, nBoot = n.boot, type = "semiparametric")
+plot(LCboot_ISLf, nCol = 3)
+LCsim_ISLf.boot <- simulate(LCboot_ISLf, nsim = n.sim/n.boot, h = y.pred)
+rates_LC_ISLf.boot.st <- LCsim_ISLf.boot$rates
+q_LC_ISLf.boot.st <- 1- exp(-rates_LC_ISLf.boot.st)
+q_LC_ISLf.boot.st.ext <-  extrapolation.sim(q_LC_ISLf.boot.st)
+dev.off()
+
+####################################
+
+####################################
+#### Confidence intervals at 90%
+####################################
+##### 1 year death probability
+conf.lev <- 0.9
+q_LC_ISLm.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_ISLm.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_ISLm.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_ISLm.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+      q_LC_ISLm.q95[j,k] <- quantile(q_LC_ISLm.st.ext[j,k,], probs=0.5+conf.lev/2)
+      q_LC_ISLm.q05[j,k] <- quantile(q_LC_ISLm.st.ext[j,k,], probs=(1-conf.lev)/2)
+      q_LC_ISLm.boot.q95[j,k] <- quantile(q_LC_ISLm.boot.st.ext[j,k,], probs=0.5+conf.lev/2)
+      q_LC_ISLm.boot.q05[j,k] <- quantile(q_LC_ISLm.boot.st.ext[j,k,], probs=(1-conf.lev)/2)
+  }
+}
+
+q_LC_ISLf.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_ISLf.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_ISLf.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_ISLf.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+      q_LC_ISLf.q95[j,k] <- quantile(q_LC_ISLf.st.ext[j,k,], probs=0.5+conf.lev/2)
+      q_LC_ISLf.q05[j,k] <- quantile(q_LC_ISLf.st.ext[j,k,], probs=(1-conf.lev)/2)
+      q_LC_ISLf.boot.q95[j,k] <- quantile(q_LC_ISLf.boot.st.ext[j,k,], probs=0.5+conf.lev/2)
+      q_LC_ISLf.boot.q05[j,k] <- quantile(q_LC_ISLf.boot.st.ext[j,k,], probs=(1-conf.lev)/2)
+  }
+}
+#write.table(q_LC_ISLm.q95,file="q_LC.ISLm.q95.txt",sep=",")
+#write.table(q_LC_ISLm.q05,file="q_LC.ISLm.q05.txt",sep=",")
+#write.table(q_LC_ISLm.boot.q95,file="q_LC.ISLm.boot.q95.txt",sep=",")
+#write.table(q_LC_ISLm.boot.q05,file="q_LC.ISLm.boot.q05.txt",sep=",")
+#write.table(q_LC_ISLf.q95,file="q_LC.ISLf.q95.txt",sep=",")
+#write.table(q_LC_ISLf.q05,file="q_LC.ISLf.q05.txt",sep=",")
+#write.table(q_LC_ISLf.boot.q95,file="q_LC.ISLf.boot.q95.txt",sep=",")
+#write.table(q_LC_ISLf.boot.q05,file="q_LC.ISLf.boot.q05.txt",sep=",")
+q_LC.ISLm.q95<-as.data.frame(q_LC_ISLm.q95)
+q_LC.ISLm.q05<-as.data.frame(q_LC_ISLm.q05)
+q_LC.ISLm.boot.q95<-as.data.frame(q_LC_ISLm.boot.q95)
+q_LC.ISLm.boot.q05<-as.data.frame(q_LC_ISLm.boot.q05)
+q_LC.ISLf.q95<-as.data.frame(q_LC_ISLf.q95)
+q_LC.ISLf.q05<-as.data.frame(q_LC_ISLf.q05)
+q_LC.ISLf.boot.q95<-as.data.frame(q_LC_ISLf.boot.q95)
+q_LC.ISLf.boot.q05<-as.data.frame(q_LC_ISLf.boot.q05)
+#male
+plot(q_LC_ISLm.ext["65",],x=c(Y.fit,Y.pred), type="l", lty=1) # evolution with t (same age)
+lines(q_LC_ISLm.q95["65",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLm.q05["65",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLm.boot.q95["65",], x=Y.pred, type="l", lty=2, col=2)
+lines(q_LC_ISLm.boot.q05["65",], x=Y.pred, type="l", lty=2, col=2)
+
+plot(q_LC_ISLm.ext["20",],x=c(Y.fit,Y.pred), type="l", lty=1) # evolution with t (same age)
+lines(q_LC_ISLm.q95["20",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLm.q05["20",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLm.boot.q95["20",], x=Y.pred, type="l", lty=2, col=2)
+lines(q_LC_ISLm.boot.q05["20",], x=Y.pred, type="l", lty=2, col=2)
+#female
+plot(q_LC_ISLf.ext["65",],x=c(Y.fit,Y.pred), type="l", lty=1) # evolution with t (same age)
+lines(q_LC_ISLf.q95["65",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLf.q05["65",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLf.boot.q95["65",], x=Y.pred, type="l", lty=2, col=2)
+lines(q_LC_ISLf.boot.q05["65",], x=Y.pred, type="l", lty=2, col=2)
+
+plot(q_LC_ISLf.ext["20",],x=c(Y.fit,Y.pred), type="l", lty=1) # evolution with t (same age)
+lines(q_LC_ISLf.q95["20",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLf.q05["20",], x=Y.pred, type="l", lty=2)
+lines(q_LC_ISLf.boot.q95["20",], x=Y.pred, type="l", lty=2, col=2)
+lines(q_LC_ISLf.boot.q05["20",], x=Y.pred, type="l", lty=2, col=2)
+dev.off()
+####################################
+
+##### 1 year survival probability, n year survival probability and life expectancy confidence interval
+p_LC_ISLm.q95 <- 1-q_LC_ISLm.q95# 1 year survival probability
+p0n_LC_ISLm.q95 <- apply(p_LC_ISLm.q95, 2, cumprod) # n year survival probability
+ex_LC_ISLm.q95 <- life.exp(q_LC_ISLm.q95) # life expectancy
+
+p_LC_ISLm.q05 <- 1-q_LC_ISLm.q05# 1 year survival probability
+p0n_LC_ISLm.q05 <- apply(p_LC_ISLm.q05, 2, cumprod) # n year survival probability
+ex_LC_ISLm.q05 <- life.exp(q_LC_ISLm.q05) # life expectancy
+
+p_LC_ISLm.boot.q95 <- 1-q_LC_ISLm.boot.q95# 1 year survival probability
+p0n_LC_ISLm.boot.q95 <- apply(p_LC_ISLm.boot.q95, 2, cumprod) # n year survival probability
+ex_LC_ISLm.boot.q95 <- life.exp(q_LC_ISLm.boot.q95) # life expectancy
+
+p_LC_ISLm.boot.q05 <- 1-q_LC_ISLm.boot.q05# 1 year survival probability
+p0n_LC_ISLm.boot.q05 <- apply(p_LC_ISLm.boot.q05, 2, cumprod) # n year survival probability
+ex_LC_ISLm.boot.q05 <- life.exp(q_LC_ISLm.boot.q05) # life expectancy
+
+p_LC_ISLf.q95 <- 1-q_LC_ISLf.q95# 1 year survival probability
+p0n_LC_ISLf.q95 <- apply(p_LC_ISLf.q95, 2, cumprod) # n year survival probability
+ex_LC_ISLf.q95 <- life.exp(q_LC_ISLf.q95) # life expectancy
+
+p_LC_ISLf.q05 <- 1-q_LC_ISLf.q05# 1 year survival probability
+p0n_LC_ISLf.q05 <- apply(p_LC_ISLf.q05, 2, cumprod) # n year survival probability
+ex_LC_ISLf.q05 <- life.exp(q_LC_ISLf.q05) # life expectancy
+
+p_LC_ISLf.boot.q95 <- 1-q_LC_ISLf.boot.q95# 1 year survival probability
+p0n_LC_ISLf.boot.q95 <- apply(p_LC_ISLf.boot.q95, 2, cumprod) # n year survival probability
+ex_LC_ISLf.boot.q95 <- life.exp(q_LC_ISLf.boot.q95) # life expectancy
+
+p_LC_ISLf.boot.q05 <- 1-q_LC_ISLf.boot.q05# 1 year survival probability
+p0n_LC_ISLf.boot.q05 <- apply(p_LC_ISLf.boot.q05, 2, cumprod) # n year survival probability
+ex_LC_ISLf.boot.q05 <- life.exp(q_LC_ISLf.boot.q05) # life expectancy
+
+ex_LC.ISLm.q05<-as.data.frame(ex_LC_ISLm.q05)
+ex_LC.ISLm.q95<-as.data.frame(ex_LC_ISLm.q95)
+ex_LC.ISLm.boot.q05<-as.data.frame(ex_LC_ISLm.boot.q05)
+ex_LC.ISLm.boot.q95<-as.data.frame(ex_LC_ISLm.boot.q95)
+ex_LC.ISLf.q05<-as.data.frame(ex_LC_ISLf.q05)
+ex_LC.ISLf.q95<-as.data.frame(ex_LC_ISLf.q95)
+ex_LC.ISLf.boot.q05<-as.data.frame(ex_LC_ISLf.boot.q05)
+ex_LC.ISLf.boot.q95<-as.data.frame(ex_LC_ISLf.boot.q95)
+####################################
+
+#################################
+##### Present value of stocastic annuities
+#################################
+p_LC_ISLm.st.ext <- 1-q_LC_ISLm.st.ext # 1 year survival probability
+ann_LC_ISLm.st <- annuity.st(q_LC_ISLm.st.ext,v_vect,0.9)
+ann_LC_ISLm.mean <- ann_LC_ISLm.st[[1]]
+ann_LC_ISLm.q95 <- ann_LC_ISLm.st[[2]]
+ann_LC_ISLm.q05 <- ann_LC_ISLm.st[[3]]
+
+########
+par(mfrow=c(1, 2))
+plot(ann_LC_ISLm.mean["65",], type="l", lty=1) # evolution with t (same age)
+lines(ann_LC_ISLm.q95["65",], type="l", lty=2)
+lines(ann_LC_ISLm.q05["65",], type="l", lty=2)
+plot(ann_LC_ISLm.mean[,"2050"], type="l", lty=1) # evolution with x (same year)
+lines(ann_LC_ISLm.q95[,"2050"], type="l", lty=2)
+lines(ann_LC_ISLm.q05[,"2050"], type="l", lty=2)
+dev.off()
+
+########
+
+p_LC_ISLf.st.ext <- 1-q_LC_ISLf.st.ext # 1 year survival probability
+ann_LC_ISLf.st <- annuity.st(q_LC_ISLf.st.ext,v_vect,0.9)
+ann_LC_ISLf.mean <- ann_LC_ISLf.st[[1]]
+ann_LC_ISLf.q95 <- ann_LC_ISLf.st[[2]]
+ann_LC_ISLf.q05 <- ann_LC_ISLf.st[[3]]
+
+########
+par(mfrow=c(1, 2))
+plot(ann_LC_ISLf.mean["65",], type="l", lty=1) # evolution with t (same age)
+lines(ann_LC_ISLf.q95["65",], type="l", lty=2)
+lines(ann_LC_ISLf.q05["65",], type="l", lty=2)
+plot(ann_LC_ISLf.mean[,"2050"], type="l", lty=1) # evolution with x (same year)
+lines(ann_LC_ISLf.q95[,"2050"], type="l", lty=2)
+lines(ann_LC_ISLf.q05[,"2050"], type="l", lty=2)
+dev.off()
+
+########
+
+ann_LC.ISLm.m <- as.data.frame(ann_LC_ISLm.mean)
+ann_LC.ISLm.q95 <- as.data.frame(ann_LC_ISLm.q95)
+ann_LC.ISLm.q05 <- as.data.frame(ann_LC_ISLm.q05)
+ann_LC.ISLf.m <- as.data.frame(ann_LC_ISLf.mean)
+ann_LC.ISLf.q95 <-as.data.frame(ann_LC_ISLf.q95)
+ann_LC.ISLf.q05<- as.data.frame(ann_LC_ISLf.q05)
+
+##### Present value of stocastic annuities : II method
+ann_LC.ISLm.c <- as.data.frame(annuity(q_LC_ISLm.ext, v_vect))
+ann_LC.ISLm.q05q <- as.data.frame(annuity(q_LC_ISLm.q95, v_vect))
+ann_LC.ISLm.q95q <- as.data.frame(annuity(q_LC_ISLm.q05, v_vect))
+ann_LC.ISLf.c <- as.data.frame(annuity(q_LC_ISLf.ext, v_vect))
+ann_LC.ISLf.q05q <- as.data.frame(annuity(q_LC_ISLf.q95, v_vect))
+ann_LC.ISLf.q95q <- as.data.frame(annuity(q_LC_ISLf.q05, v_vect))
+#################################
+
+#################################
+##### writing results on an excel file
+#################################
+write_xlsx(q_LC.ISLm, "q_LC.ISLm.xlsx")
+write_xlsx(p_LC.ISLm, "p_LC.ISLm.xlsx")
+write_xlsx(p0n_LC.ISLm, "p0n_LC.ISLm.xlsx")
+
+write_xlsx(q_LC.ISLf, "q_LC.ISLf.xlsx")
+write_xlsx(p_LC.ISLf, "p_LC.ISLf.xlsx")
+write_xlsx(p0n_LC.ISLf, "p0n_LC.ISLf.xlsx")
+
+write_xlsx(q_LC.ISLm.q95, "q_LC.ISLm.q95.xlsx")
+write_xlsx(q_LC.ISLm.q05, "q_LC.ISLm.q05.xlsx")
+write_xlsx(q_LC.ISLm.boot.q95, "q_LC.ISLm.boot.q95.xlsx")
+write_xlsx(q_LC.ISLm.boot.q05, "q_LC.ISLm.boot.q05.xlsx")
+
+write_xlsx(q_LC.ISLf.q95, "q_LC.ISLf.q95.xlsx")
+write_xlsx(q_LC.ISLf.q05, "q_LC.ISLf.q05.xlsx")
+write_xlsx(q_LC.ISLf.boot.q95, "q_LC.ISLf.boot.q95.xlsx")
+write_xlsx(q_LC.ISLf.boot.q05, "q_LC.ISLf.boot.q05.xlsx")
+
+write_xlsx(list(ex_LC.ISLm.boot.q05,ex_LC.ISLm.q05,ex_LC.ISLm,ex_LC.ISLm.q95,ex_LC.ISLm.boot.q95),"ex_LC.ISLm.xlsx")
+write_xlsx(list(ex_LC.ISLf.boot.q05,ex_LC.ISLf.q05,ex_LC.ISLf,ex_LC.ISLf.q95,ex_LC.ISLf.boot.q95),"ex_LC.ISLf.xlsx")
+
+write_xlsx(list(ann_LC.ISLm.q05,ann_LC.ISLm.m,ann_LC.ISLm.q95),"ann_LC.ISLm.xlsx")
+write_xlsx(list(ann_LC.ISLf.q05,ann_LC.ISLf.m,ann_LC.ISLf.q95),"ann_LC.ISLf.xlsx")
+
+write_xlsx(list(ann_LC.ISLm.q05q,ann_LC.ISLm.c,ann_LC.ISLm.q95q),"ann_LC.ISLmq.xlsx")
+write_xlsx(list(ann_LC.ISLf.q05q,ann_LC.ISLf.c,ann_LC.ISLf.q95q),"ann_LC.ISLfq.xlsx")
+```
+
+At the end of this work we have found out that the best mortality model for the Iceland population is the Lee-Carter model.
+Considering that Iceland has a very small population (= 364.134 individuals, at the beginning of year 2020) we got quite good results in terms of randomness in the plots, that consider the fitting of the Iceland population, for almost all the models (RH, CBD, LC, APC, M7, PLAT).
+When we have decided the best models given the values of the goodness of fit and when we compared the residual plots of the models, we have found out that the best ones were the LC, RH and PLAT models. But still we had some difficulties about the amount of uncertainty which is present when we have forecasted our models. This can be due to the fact that we considered a very large range of ages (from age 20 to age 99), additionally, we’ve also considered 100 years of forecasts which is quite a large amount of years to forecast. Another strong assumption was made in setting only 20 samples bootstrap, because we know that, in order to get more precise results, we should have considered a larger amount of samples to bootstrap.
+Even considering all of these assumptions, the LC model was the one that produced the best and most realistic results also in terms of consistency with historical trends and variability in mortality data. While the RH and PLAT showed very unrealistic forecasts (in particular when we have plotted the Life Expectancy of male and female individuals): it’s clearly unrealistic to assume in the future that male individuals will expect to live much more compared to female individuals with the same age. At maximum, we should expect in the future that, thanks to new technologies and better condition of living, the discrepancy in Life Expectancy between male and female individuals will tend to decrease, but still we expect that female individuals will live longer than male individuals. So, the RH and PLAT models violates the biological Long-term dynamics of the Iceland population.
+Moreover, I would select the Lee Carter model as the best one because it’s relatively easier to implement w.r. to the RH model which is a bit more computationally intensive model. The RH model was the best one in terms of log-likelihood but the difference with the results of the LC model was very small and it was also misleading, because at the very end of this work we’ve verified that the Lee-Carter is the best model for the Iceland population, given the assumptions that we’ve made at the beginning of this work.
